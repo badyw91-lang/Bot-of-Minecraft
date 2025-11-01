@@ -1,0 +1,16 @@
+{
+  "name": "mc-keepalive-bot",
+  "version": "1.1.0",
+  "description": "Minecraft keep-alive bot for Railway / VPS — mineflayer + pathfinder",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "author": "Dark",
+  "license": "MIT",
+  "dependencies": {
+    "mineflayer": "^4.3.0",
+    "mineflayer-pathfinder": "^1.4.0",
+    "minecraft-data": "^2.0.0"
+  }
+}
