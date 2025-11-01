@@ -58,7 +58,7 @@ function createBot() {
     port: CONFIG.MC_PORT,
     username: CONFIG.MC_USERNAME,
     password: CONFIG.MC_PASSWORD || undefined,
-    version: CONFIG.MC_VERSION || false,
+    version: '1.20.4',
   });
 
   // load pathfinder plugin early
