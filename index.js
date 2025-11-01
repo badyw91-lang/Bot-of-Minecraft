@@ -1,197 +1,224 @@
-// index.js
-// بوت يبقى متصل + ي respawn عند الموت + ينفذ أوامر بين قوسين (مثال: (الحقني))
-// ويدعم متابعة اللاعب باستخدام mineflayer-pathfinder إذا كان داخل 30 بلوك.
+/**
+ * index.js
+ * Minecraft keep-alive bot — Render-ready
+ * - Express HTTP endpoint to keep service awake on Render
+ * - Mineflayer bot with pathfinder
+ * - Respawn handling on death (if supported)
+ * - Coded chat commands in parentheses: (الحقني) to follow, (توقف) to stop
+ * - Random semi-human actions to avoid AFK detection
+ */
 
 const mineflayer = require('mineflayer');
+const express = require('express');
 const { pathfinder, Movements, goals: { GoalFollow } } = require('mineflayer-pathfinder');
 const mcDataLib = require('minecraft-data');
 
+// ---- CONFIG (from environment variables) ----
 const CONFIG = {
-  host: process.env.MC_HOST || '127.0.0.1',
-  port: parseInt(process.env.MC_PORT || '25565', 10),
-  username: process.env.MC_USERNAME || 'KeepAliveBot',
-  password: process.env.MC_PASSWORD || undefined,
-  version: process.env.MC_VERSION || false,
-  minActionDelay: parseInt(process.env.MIN_ACTION_DELAY || '5000', 10),
-  maxActionDelay: parseInt(process.env.MAX_ACTION_DELAY || '20000', 10),
-  reconnectDelay: parseInt(process.env.RECONNECT_DELAY || '8000', 10),
-  chatProbability: parseFloat(process.env.CHAT_PROBABILITY || '0.08'),
-  greetings: (process.env.GREETINGS && process.env.GREETINGS.split('|')) || ['hi', 'hello', 'anyone here?', 'keeping server alive'],
-  followMaxStartDistance: parseFloat(process.env.FOLLOW_START_DISTANCE || '30'), // بلوك
-  followStopDistance: parseFloat(process.env.FOLLOW_STOP_DISTANCE || '35'), // لو بعد كذا يوقف
-  followTimeoutMs: parseInt(process.env.FOLLOW_TIMEOUT_MS || String(30 * 1000), 10) // مدة المتابعة الافتراضية
+  // Minecraft connection
+  MC_HOST: process.env.MC_HOST || '127.0.0.1',
+  MC_PORT: parseInt(process.env.MC_PORT || '25565', 10),
+  MC_USERNAME: process.env.MC_USERNAME || 'KeepAliveBot',
+  MC_PASSWORD: process.env.MC_PASSWORD || undefined,
+  MC_VERSION: process.env.MC_VERSION || false, // false = auto
+
+  // Behavior timing (ms)
+  MIN_ACTION_DELAY: parseInt(process.env.MIN_ACTION_DELAY || '5000', 10),
+  MAX_ACTION_DELAY: parseInt(process.env.MAX_ACTION_DELAY || '20000', 10),
+  RECONNECT_DELAY: parseInt(process.env.RECONNECT_DELAY || '8000', 10),
+
+  // Chat & follow
+  CHAT_PROBABILITY: parseFloat(process.env.CHAT_PROBABILITY || '0.08'),
+  GREETINGS: (process.env.GREETINGS && process.env.GREETINGS.split('|')) || ['hi', 'hello', 'anyone here?', 'keeping server alive'],
+  FOLLOW_START_DISTANCE: parseFloat(process.env.FOLLOW_START_DISTANCE || '30'), // blocks to allow start
+  FOLLOW_STOP_DISTANCE: parseFloat(process.env.FOLLOW_STOP_DISTANCE || '35'),   // blocks to stop following
+  FOLLOW_TIMEOUT_MS: parseInt(process.env.FOLLOW_TIMEOUT_MS || String(30 * 1000), 10) // follow max time
 };
 
+// ---- Global state ----
 let bot = null;
 let actionTimer = null;
 let reconnectTimer = null;
 let followTimeout = null;
+let followCheckInterval = null;
 
+// ---- Small HTTP server for Render keep-alive ----
+const app = express();
+app.get('/', (req, res) => res.send('MC KeepAlive Bot is UP ✅'));
+app.get('/health', (req, res) => res.json({ ok: true, ts: Date.now() }));
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => console.log(`[http] server listening on ${PORT}`));
+
+// ---- Bot creation ----
 function createBot() {
-  console.log('[keepalive] connecting to', CONFIG.host + ':' + CONFIG.port, 'as', CONFIG.username);
+  console.log('[bot] connecting to', `${CONFIG.MC_HOST}:${CONFIG.MC_PORT}`, 'as', CONFIG.MC_USERNAME);
 
   bot = mineflayer.createBot({
-    host: CONFIG.host,
-    port: CONFIG.port,
-    username: CONFIG.username,
-    password: CONFIG.password || undefined,
-    version: CONFIG.version || false,
+    host: CONFIG.MC_HOST,
+    port: CONFIG.MC_PORT,
+    username: CONFIG.MC_USERNAME,
+    password: CONFIG.MC_PASSWORD || undefined,
+    version: CONFIG.MC_VERSION || false,
   });
 
-  // load pathfinder plugin
+  // load pathfinder plugin early
   bot.loadPlugin(pathfinder);
 
   bot.once('spawn', () => {
-    console.log('[keepalive] spawned. setting up movements & behavior loop.');
-
-    // setup movements (required for pathfinder)
+    console.log('[bot] spawned into world.');
     try {
       const mcData = mcDataLib(bot.version);
-      const defaultMove = new Movements(bot, mcData);
-      bot.pathfinder.setMovements(defaultMove);
+      const movements = new Movements(bot, mcData);
+      bot.pathfinder.setMovements(movements);
     } catch (e) {
-      console.log('[keepalive] warning: failed to init mcData/movements:', e && e.message ? e.message : e);
+      console.log('[bot] warning: failed to init movements:', e && e.message ? e.message : e);
     }
-
-    startBehaviorLoop();
+    startActionLoop();
   });
 
-  // respawn on death (if server allows it)
+  // Death -> try respawn or reconnect
   bot.on('death', () => {
-    console.log('[keepalive] I died! trying to respawn...');
-    // بعض إصدارات mineflayer توفر bot.respawn()
+    console.log('[bot] died. attempting respawn or reconnect...');
+    // some versions have bot.respawn()
     if (typeof bot.respawn === 'function') {
       try {
         setTimeout(() => {
-          try { bot.respawn(); console.log('[keepalive] called bot.respawn()'); } catch (e) { console.log('[keepalive] respawn error:', e && e.message ? e.message : e); }
-        }, 1000);
+          try { bot.respawn(); console.log('[bot] respawn called'); } catch (e) { console.log('[bot] respawn error:', e && e.message ? e.message : e); }
+        }, 800);
       } catch (e) {
-        console.log('[keepalive] respawn exception:', e && e.message ? e.message : e);
+        console.log('[bot] respawn exception:', e && e.message ? e.message : e);
       }
     } else {
-      console.log('[keepalive] bot.respawn() not available in this version — reconnecting instead.');
-      // طريقة بديلة: نغلق ونعاود الاتصال
+      // fallback: quit and let reconnect logic handle it
       try { bot.quit(); } catch (e) {}
     }
   });
 
   bot.on('end', (reason) => {
-    console.log('[keepalive] disconnected:', reason);
-    stopBehaviorLoop();
+    console.log('[bot] connection ended:', reason);
+    stopActionLoop();
     scheduleReconnect();
   });
 
-  bot.on('kicked', (reason, loggedIn) => {
-    console.log('[keepalive] kicked:', reason, 'loggedIn:', loggedIn);
+  bot.on('kicked', (reason) => {
+    console.log('[bot] kicked:', reason);
   });
 
   bot.on('error', (err) => {
-    console.log('[keepalive] error:', err && err.message ? err.message : err);
+    console.log('[bot] error:', err && err.message ? err.message : err);
   });
 
-  // chat handler: يبحث عن أوامر داخل قوسين: (command)
+  // Chat handler: look for coded commands inside parentheses ( ... )
   bot.on('chat', (username, message) => {
-    if (!bot || !bot.username) return;
-    if (username === bot.username) return;
+    try {
+      if (!bot || !bot.username) return;
+      if (username === bot.username) return;
+      const trimmed = String(message).trim();
+      const match = trimmed.match(/^\((.+)\)$/);
+      if (!match) return;
 
-    const trimmed = message.trim();
-    const match = trimmed.match(/^\((.+)\)$/); // يأخذ كل ما بين القوسين
-    if (!match) return;
+      const cmd = match[1].trim();
+      console.log('[bot] coded command from', username, ':', cmd);
 
-    const cmd = match[1].trim();
-    console.log(`[keepalive] received coded chat command from ${username}: (${cmd})`);
-
-    // دعم أمر (الحقني)
-    if (cmd === 'الحقني' || cmd.toLowerCase() === 'follow me') {
-      tryFollowPlayer(username);
-    } else {
-      // هنا تقدر تضيف أوامر جديدة بسهولة
-      console.log('[keepalive] unknown coded command:', cmd);
+      if (cmd === 'الحقني' || cmd.toLowerCase() === 'follow me') {
+        tryFollowPlayer(username);
+      } else if (cmd === 'توقف' || cmd.toLowerCase() === 'stop') {
+        stopFollowing();
+        safeChat(`تم إيقاف المتابعة.`);
+      } else {
+        // يمكن إضافة أوامر جديدة هنا بسهولة
+        console.log('[bot] unknown coded command:', cmd);
+      }
+    } catch (e) {
+      console.log('[bot] chat handler error:', e && e.message ? e.message : e);
     }
   });
 }
 
-// يحاول متابعة اللاعب إذا كان ضمن مسافة بداية محددة (مثلاً 30 بلوك)
+// ---- Follow logic ----
 function tryFollowPlayer(username) {
   if (!bot) return;
   const player = bot.players[username];
   if (!player || !player.entity) {
-    console.log('[keepalive] player entity not found for', username);
+    console.log('[follow] player entity not found for', username);
+    safeChat(`ما لقيتك ${username}.`);
     return;
   }
-
   if (!bot.entity || !bot.entity.position) {
-    console.log('[keepalive] bot position unknown, cannot follow yet.');
+    console.log('[follow] bot position unknown');
     return;
   }
 
-  const playerPos = player.entity.position;
-  const botPos = bot.entity.position;
-  const dist = botPos.distanceTo(playerPos);
-  console.log(`[keepalive] distance to ${username} is ${dist.toFixed(2)} blocks.`);
+  const dist = bot.entity.position.distanceTo(player.entity.position);
+  console.log(`[follow] distance to ${username}: ${dist.toFixed(2)} blocks`);
 
-  if (dist <= CONFIG.followMaxStartDistance) {
-    // نبدأ متابعة باستخدام goal GoalFollow
-    console.log(`[keepalive] starting follow ${username} (distance ${dist.toFixed(1)} <= ${CONFIG.followMaxStartDistance})`);
+  if (dist <= CONFIG.FOLLOW_START_DISTANCE) {
+    console.log('[follow] starting follow:', username);
     try {
-      const followGoal = new GoalFollow(player.entity, 1); // الهدف: قريب جداً من اللاعب (1)
-      bot.pathfinder.setGoal(followGoal, true);
+      // start following
+      const goal = new GoalFollow(player.entity, 1);
+      bot.pathfinder.setGoal(goal, true);
+      safeChat(`جاي وراك يا ${username} 🐾`);
 
-      // مسح أي Timeout سابق
+      // clear previous timers/intervals
       if (followTimeout) clearTimeout(followTimeout);
-      // ضبط Timeout لإيقاف المتابعة بعد مدة محددة
-      followTimeout = setTimeout(() => {
-        stopFollowing();
-      }, CONFIG.followTimeoutMs);
+      if (followCheckInterval) clearInterval(followCheckInterval);
 
-      // مراقبة المسافة: إذا صار أبعد من followStopDistance نوقف المتابعة
-      const checkInterval = setInterval(() => {
-        if (!bot || !bot.entity) { clearInterval(checkInterval); return; }
+      // timeout to stop following after configured ms
+      followTimeout = setTimeout(() => {
+        console.log('[follow] follow timeout reached, stopping.');
+        stopFollowing();
+      }, CONFIG.FOLLOW_TIMEOUT_MS);
+
+      // check distance periodically — stop if player too far or disconnected
+      followCheckInterval = setInterval(() => {
+        if (!bot || !bot.entity) {
+          clearInterval(followCheckInterval);
+          followCheckInterval = null;
+          return;
+        }
         const p = bot.players[username];
         if (!p || !p.entity) {
-          console.log('[keepalive] player disconnected or entity gone — stopping follow.');
-          clearInterval(checkInterval);
+          console.log('[follow] player lost or disconnected — stopping follow.');
           stopFollowing();
           return;
         }
         const d = bot.entity.position.distanceTo(p.entity.position);
-        if (d > CONFIG.followStopDistance) {
-          console.log('[keepalive] player too far (', d.toFixed(1), '>) stopping follow.');
-          clearInterval(checkInterval);
+        if (d > CONFIG.FOLLOW_STOP_DISTANCE) {
+          console.log('[follow] player too far (', d.toFixed(1), ') — stopping follow.');
           stopFollowing();
         }
       }, 2000);
-
     } catch (e) {
-      console.log('[keepalive] follow error:', e && e.message ? e.message : e);
+      console.log('[follow] error starting follow:', e && e.message ? e.message : e);
     }
   } else {
-    console.log(`[keepalive] player too far to start follow (${dist.toFixed(1)} > ${CONFIG.followMaxStartDistance})`);
-    // اختيار: نرد بعلامة شات لو نبي
-    try { bot.chat(`معليش ${username} بعيد (${Math.round(dist)} بلوك)`); } catch (e) {}
+    console.log('[follow] player too far to start follow:', dist.toFixed(1));
+    safeChat(`معليش ${username} بعيد (${Math.round(dist)} بلوك)`);
   }
 }
 
 function stopFollowing() {
   try {
+    if (!bot) return;
     bot.pathfinder.setGoal(null);
-    console.log('[keepalive] stopped following.');
+    console.log('[follow] stopped following.');
     if (followTimeout) { clearTimeout(followTimeout); followTimeout = null; }
+    if (followCheckInterval) { clearInterval(followCheckInterval); followCheckInterval = null; }
   } catch (e) {
-    console.log('[keepalive] error stopping follow:', e && e.message ? e.message : e);
+    console.log('[follow] error stopping follow:', e && e.message ? e.message : e);
   }
 }
 
-// السلوك العشوائي لتجنب AFK
-let actionTimerRef = null;
-function startBehaviorLoop() {
-  if (actionTimerRef) clearTimeout(actionTimerRef);
+// ---- Random action loop (anti-AFK) ----
+function startActionLoop() {
+  if (actionTimer) clearTimeout(actionTimer);
   scheduleNextAction();
 }
 
 function scheduleNextAction() {
-  const delay = CONFIG.minActionDelay + Math.floor(Math.random() * (CONFIG.maxActionDelay - CONFIG.minActionDelay + 1));
-  actionTimerRef = setTimeout(() => {
+  const delay = CONFIG.MIN_ACTION_DELAY + Math.floor(Math.random() * (CONFIG.MAX_ACTION_DELAY - CONFIG.MIN_ACTION_DELAY + 1));
+  actionTimer = setTimeout(() => {
     doRandomAction();
     scheduleNextAction();
   }, delay);
@@ -199,18 +226,20 @@ function scheduleNextAction() {
 
 function doRandomAction() {
   if (!bot || !bot.entity) return;
+
   const actions = ['look', 'walk', 'jump', 'sneak'];
   const choice = actions[Math.floor(Math.random() * actions.length)];
 
   try {
     if (choice === 'look') {
       const yaw = Math.random() * Math.PI * 2;
-      const pitch = (Math.random() - 0.5) * Math.PI * 0.7;
+      const pitch = (Math.random() - 0.5) * Math.PI * 0.6;
       bot.look(yaw, pitch, true);
     } else if (choice === 'walk') {
-      const duration = 500 + Math.floor(Math.random() * 1800);
+      // short forward step with a small random yaw
+      const duration = 500 + Math.floor(Math.random() * 1600);
       const turnYaw = (Math.random() - 0.5) * 0.9;
-      try { bot.look(bot.entity.yaw + turnYaw, bot.entity.pitch, true); } catch (e) {}
+      try { bot.look((bot.entity.yaw || 0) + turnYaw, bot.entity.pitch || 0, true); } catch (e) {}
       bot.setControlState('forward', true);
       setTimeout(() => bot.setControlState('forward', false), duration);
     } else if (choice === 'jump') {
@@ -222,36 +251,41 @@ function doRandomAction() {
       setTimeout(() => bot.setControlState('sneak', false), dur);
     }
 
-    if (Math.random() < CONFIG.chatProbability) {
-      const msg = CONFIG.greetings[Math.floor(Math.random() * CONFIG.greetings.length)];
-      try { bot.chat(msg); } catch (e) {}
+    // small chance to chat
+    if (Math.random() < CONFIG.CHAT_PROBABILITY) {
+      const msg = CONFIG.GREETINGS[Math.floor(Math.random() * CONFIG.GREETINGS.length)];
+      safeChat(msg);
     }
-    console.log('[keepalive] did action:', choice);
+
+    console.log('[action] did action:', choice);
   } catch (e) {
-    console.log('[keepalive] action error:', e && e.message ? e.message : e);
+    console.log('[action] error:', e && e.message ? e.message : e);
   }
 }
 
-function stopBehaviorLoop() {
-  if (actionTimerRef) { clearTimeout(actionTimerRef); actionTimerRef = null; }
+function stopActionLoop() {
+  if (actionTimer) { clearTimeout(actionTimer); actionTimer = null; }
   stopFollowing();
 }
 
+// ---- Utilities ----
 function scheduleReconnect() {
   if (reconnectTimer) return;
   reconnectTimer = setTimeout(() => {
     reconnectTimer = null;
-    console.log('[keepalive] reconnecting...');
-    createBot();
-  }, CONFIG.reconnectDelay);
+    console.log('[bot] reconnecting...');
+    try { createBot(); } catch (e) { console.log('[bot] reconnect createBot error:', e && e.message ? e.message : e); }
+  }, CONFIG.RECONNECT_DELAY);
 }
 
-process.on('SIGINT', () => {
-  console.log('[keepalive] SIGINT, shutting down');
-  stopBehaviorLoop();
-  if (bot) try { bot.quit(); } catch (e) {}
-  process.exit(0);
-});
+function safeChat(text) {
+  try {
+    if (bot && typeof bot.chat === 'function') bot.chat(String(text).slice(0, 256));
+  } catch (e) {
+    // ignore chat errors
+  }
+}
 
-// start
+// ---- Start everything ----
 createBot();
+
